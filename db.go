@@ -1,99 +1,79 @@
 package revmongo
 
 import (
+	"context"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
 
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
+	"github.com/qiniu/qmgo"
 	"github.com/revel/revel"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// learn from leanote, put all db actions in one file
 var (
-	Session *mgo.Session
-	DBName  string
-	Dial    string
+	DBName string
+	Dial   string
+	Client *qmgo.Client
+	DB     *qmgo.Database
 )
 
-//App Init setup mgo connection
 func Init() {
-	//init mgoDB
 	Connect()
-
-	//New bind type
-	objID := bson.NewObjectId()
+	objID := primitive.NewObjectID()
 	revel.TypeBinders[reflect.TypeOf(objID)] = ObjectIDBinder
-	fmt.Println("Debug", revel.TypeBinders)
 }
 
-//MgoDBConnect do mgo connection
+func NewClient(ctx context.Context) (*qmgo.Client, error) {
+	if Dial == "" {
+		return nil, fmt.Errorf("Mongodb connection not defined")
+	}
+	return qmgo.NewClient(ctx, &qmgo.Config{Uri: Dial})
+}
+
+// Connect to database and return client
 func Connect() {
 	var err error
 	var found bool
 
-	Dial = revel.Config.StringDefault("mongodb.dial", "localhost")
+	defer func() {
+		if Client != nil {
+			DB = Client.Database(DBName)
+			if err != nil {
+				revel.AppLog.Errorf("Could not connect to Mongo DB. Error: %s", err)
+			}
+		}
+	}()
+
+	if Dial, found = revel.Config.String("mongodb.dial"); !found {
+		revel.AppLog.Crit("Mongodb connection not defined")
+	}
+
 	if DBName, found = revel.Config.String("mongodb.name"); !found {
 		urls := strings.Split(Dial, "/")
 		DBName = urls[len(urls)-1]
 	}
-	if Session == nil {
-		Session, err = mgo.Dial(Dial)
+
+	if Client == nil {
+		ctx := context.Background()
+		Client, err = qmgo.NewClient(ctx, &qmgo.Config{Uri: Dial})
 		if err != nil {
+			Client = nil
 			revel.AppLog.Errorf("Could not connect to Mongo DB. Error: %v", err)
-			for i := 0; i <= 3; i++ {
+			for i := 0; i < 3; i++ {
 				revel.AppLog.Info("Retry connect to database ...")
 				time.Sleep(3 * time.Second)
-				Session, err = mgo.Dial(Dial)
+				Client, err = qmgo.NewClient(ctx, &qmgo.Config{Uri: Dial})
 				if err == nil {
 					break
 				} else {
-					revel.AppLog.Errorf("Could not connect to Mongo DB. Error: %v", err)
+					revel.AppLog.Errorf("Retry time %v could not connect to Mongo DB. Error: %v", i+1, err)
 				}
+
 			}
 		}
 	}
-}
-
-// NewConnect return mgo.Session for manual input mongodb information
-func NewConnect(conStr string) (*mgo.Session, error) {
-	return mgo.Dial(conStr)
-}
-
-func NewMgoSession() *mgo.Session {
-	s := Session.Clone()
-	return s
-}
-
-//MgoControllerInit should be put in controller init function
-func MgoControllerInit() {
-	revel.InterceptMethod((*MgoController).Begin, revel.BEFORE)
-	revel.InterceptMethod((*MgoController).End, revel.FINALLY)
-}
-
-//MgoController including the mgo session
-type MgoController struct {
-	MgoSession *mgo.Session
-}
-
-//Begin do mgo connection
-func (c *MgoController) Begin() revel.Result {
-	if Session == nil {
-		Connect()
-	}
-
-	c.MgoSession = Session.Clone()
-	return nil
-}
-
-//End close mgo session
-func (c *MgoController) End() revel.Result {
-	if c.MgoSession != nil {
-		c.MgoSession.Close()
-	}
-	return nil
 }
 
 // ObjectIDBinder do binding
@@ -103,24 +83,18 @@ var ObjectIDBinder = revel.Binder{
 		if len(val) == 0 {
 			return reflect.Zero(typ)
 		}
-		if bson.IsObjectIdHex(val) {
-			objID := bson.ObjectIdHex(val)
+		if objID, err := primitive.ObjectIDFromHex(val); err == nil {
 			return reflect.ValueOf(objID)
 		}
 
-		revel.AppLog.Error("ObjectIDBinder.Bind - invalid ObjectId!")
+		revel.AppLog.Errorf("ObjectIDBinder.Bind - invalid ObjectId!")
 		return reflect.Zero(typ)
 	}),
 	// Turns ObjectId back to hexString for reverse routing
 	Unbind: func(output map[string]string, name string, val interface{}) {
 		var hexStr string
-		hexStr = fmt.Sprintf("%s", val.(bson.ObjectId).Hex())
+		hexStr = fmt.Sprintf("%s", val.(primitive.ObjectID).Hex())
 		// not sure if this is too carefull but i wouldn't want invalid ObjectIds in my App
-		if bson.IsObjectIdHex(hexStr) {
-			output[name] = hexStr
-		} else {
-			revel.AppLog.Error("ObjectIDBinder.Bind - invalid ObjectId!")
-			output[name] = ""
-		}
+		output[name] = hexStr
 	},
 }

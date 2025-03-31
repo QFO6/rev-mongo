@@ -1,66 +1,538 @@
 package revmongo
 
 import (
+	"context"
 	"errors"
+	"log"
 	"reflect"
 	"strings"
 	"time"
 
-	"github.com/globalsign/mgo"
-	"github.com/globalsign/mgo/bson"
+	"github.com/qiniu/qmgo"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// Do wrap all common functions
+//Do wrap all common functions
 type Do struct {
-	model         interface{}
-	session       *mgo.Session
-	collection    *mgo.Collection
-	logCollection *mgo.Collection // for change log
-	Query         bson.M
-	Sort          []string
-	Skip          int
-	Limit         int
-	Operator      string
-	Reason        string
+	model    interface{}
+	Ctx      context.Context
+	Query    bson.M
+	Client   *qmgo.Client
+	Coll     *qmgo.Collection
+	Sort     []string
+	Skip     int64
+	Limit    int64
+	Select   []string
+	Operator string
+	Reason   string
+	SaveLog  bool // default is false
 }
 
-// NewDo initiate with input model and mgo session
-func NewDo(s *mgo.Session, dbName string, model interface{}) *Do {
-	do := &Do{model: model, session: s}
-	do.collection = Collection(s, dbName, model)
-	do.logCollection = Collection(s, dbName, "ChangeLog")
-	//do.Operator = operator
-	//do.Reason = reason
-	return do
+// New using mongodo Client
+func New(model interface{}) *Do {
+	colName := getModelName(model)
+	coll := DB.Collection(colName)
+	return &Do{model: model, Coll: coll, Ctx: context.Background()}
 }
 
-// New create a *Do with pre-defined DBName
-func New(s *mgo.Session, model interface{}) *Do {
-	do := &Do{model: model, session: s}
-	do.collection = Collection(s, DBName, model)
-	do.logCollection = Collection(s, DBName, "ChangeLog")
-	//do.Operator = operator
-	//do.Reason = reason
-	return do
+//NewDo initiate with input model and db name, backfoward compatible
+func NewDo(dbName string, model interface{}) *Do {
+	colName := getModelName(model)
+	coll := Client.Database(dbName).Collection(colName)
+	return &Do{model: model, Coll: coll, Ctx: context.Background()}
 }
 
-// New with C, with collection Name for collection name diff with model name
-func NewWithC(s *mgo.Session, model interface{}, cName string) *Do {
-	do := &Do{model: model, session: s}
-	do.collection = Collection(s, DBName, cName)
-	do.logCollection = Collection(s, DBName, "ChangeLog")
-	//do.Operator = operator
-	//do.Reason = reason
-	return do
+//NewWithDB initiate with input model and db name
+func NewWithDBName(dbName string, model interface{}) *Do {
+	colName := getModelName(model)
+	coll := Client.Database(dbName).Collection(colName)
+	return &Do{model: model, Coll: coll, Ctx: context.Background()}
 }
 
-// Collection conduct mgo.Collection
-func Collection(s *mgo.Session, dbName string, m interface{}) *mgo.Collection {
-	cName := getModelName(m)
-	return s.DB(dbName).C(cName)
+// New with C, with Coll Name for Coll name diff with model name
+func NewWithC(model interface{}, cName string) *Do {
+	Coll := Collection(DBName, cName)
+	return &Do{model: model, Coll: Coll, Ctx: context.Background()}
 }
 
-// getModelName reflect string name from model
+// NewWithCtx with Ctx input and model
+func NewWithCtx(ctx context.Context, model interface{}) *Do {
+	colName := getModelName(model)
+	coll := DB.Collection(colName)
+	return &Do{model: model, Coll: coll, Ctx: ctx}
+}
+
+func Collection(dbName string, m interface{}) *qmgo.Collection {
+	collectionName := getModelName(m)
+	return Client.Database(dbName).Collection(collectionName)
+}
+
+// Create will generate Id for model
+func (m *Do) Create() error {
+	timeNow := time.Now()
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	x := reflect.ValueOf(m.model).Elem().FieldByName("CreatedAt")
+	if x.IsValid() {
+		x.Set(reflect.ValueOf(timeNow))
+	}
+	by := reflect.ValueOf(m.model).Elem().FieldByName("CreatedBy")
+	if by.IsValid() {
+		by.Set(reflect.ValueOf(m.Operator))
+	}
+	l := reflect.ValueOf(m.model).Elem().FieldByName("LatestTime")
+	if l.IsValid() {
+		l.Set(reflect.ValueOf(timeNow))
+	}
+	isRemoved := reflect.ValueOf(m.model).Elem().FieldByName("IsRemoved")
+	if isRemoved.IsValid() {
+		removeValue := false
+		isRemoved.Set(reflect.ValueOf(&removeValue))
+	}
+	// Important: make sure the sessCtx used in every operation in the whole transaction
+	// start transaction
+	if result, err := m.Coll.InsertOne(m.Ctx, m.model); err != nil {
+		return err
+	} else {
+		if id.IsValid() {
+			id.Set(reflect.ValueOf(result.InsertedID))
+		}
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+	time.Sleep(1 * time.Second)
+	if err := m.saveLog(CREATE); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// CreateWithLog record log for creation
+func (m *Do) CreateWithLog() error {
+	var err error
+	err = m.Create()
+	if err != nil {
+		return err
+	}
+
+	time.Sleep(1 * time.Second)
+	err = m.saveLog(CREATE)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Save method, upsert record with UpdatedAt as now
+func (m *Do) Save() error {
+	timeNow := time.Now()
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	x := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedAt")
+	if x.IsValid() {
+		x.Set(reflect.ValueOf(timeNow))
+	}
+	by := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedBy")
+	if by.IsValid() {
+		by.Set(reflect.ValueOf(m.Operator))
+	}
+	l := reflect.ValueOf(m.model).Elem().FieldByName("LatestTime")
+	if l.IsValid() {
+		l.Set(reflect.ValueOf(timeNow))
+	}
+
+	if err := m.Coll.UpdateOne(m.Ctx, bson.M{"_id": id.Interface()}, bson.M{"$set": m.model}); err != nil {
+		return err
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+
+	if err := m.saveLog(UPDATE); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SaveIf update record according to Id and Query
+func (m *Do) SaveIf() error {
+	timeNow := time.Now()
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	x := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedAt")
+	if x.IsValid() {
+		x.Set(reflect.ValueOf(timeNow))
+	}
+	by := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedBy")
+	if by.IsValid() {
+		by.Set(reflect.ValueOf(m.Operator))
+	}
+	l := reflect.ValueOf(m.model).Elem().FieldByName("LatestTime")
+	if l.IsValid() {
+		l.Set(reflect.ValueOf(timeNow))
+	}
+
+	// check query
+	if m.Query == nil {
+		return errors.New("Query must be defined for SaveIf")
+	}
+	query := m.Query
+	query["_id"] = id.Interface()
+
+	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}); err != nil {
+		return err
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+	if err := m.saveLog(UPDATE); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// SaveIf update record according to Id and Query
+func (m *Do) SaveIfWithLog() error {
+	timeNow := time.Now()
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	x := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedAt")
+	if x.IsValid() {
+		x.Set(reflect.ValueOf(timeNow))
+	}
+	by := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedBy")
+	if by.IsValid() {
+		by.Set(reflect.ValueOf(m.Operator))
+	}
+	l := reflect.ValueOf(m.model).Elem().FieldByName("LatestTime")
+	if l.IsValid() {
+		l.Set(reflect.ValueOf(timeNow))
+	}
+
+	// check query
+	if m.Query == nil {
+		return errors.New("Query must be defined for SaveIf")
+	}
+	query := m.Query
+	query["_id"] = id.Interface()
+
+	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}); err != nil {
+		return err
+	}
+
+	if err := m.saveLog(UPDATE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SaveWithLog save record and inset a new changelog record
+func (m *Do) SaveWithLog() error {
+	if err := m.Save(); err != nil {
+		return err
+	}
+	if err := m.saveLog(UPDATE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Erase is hard delete according Id
+func (m *Do) Erase() error {
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	if err := m.Coll.Remove(m.Ctx, bson.M{"_id": id.Interface()}); err != nil {
+		return err
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+
+	if err := m.saveLog(ERASE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Remove is hard delete
+func (m *Do) Remove() error {
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	if err := m.Coll.Remove(m.Ctx, bson.M{"_id": id.Interface()}); err != nil {
+		return err
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+
+	if err := m.saveLog(REMOVE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// EraseWithLog, hard delete record and insert a chagnelog
+func (m *Do) EraseWithLog() error {
+	if err := m.Erase(); err != nil {
+		return err
+	}
+
+	if err := m.saveLog(ERASE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Delete is softe delete
+func (m *Do) Delete() error {
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	x := reflect.ValueOf(m.model).Elem().FieldByName("RemovedAt")
+	if x.IsValid() {
+		x.Set(reflect.ValueOf(time.Now()))
+	}
+	by := reflect.ValueOf(m.model).Elem().FieldByName("RemovedBy")
+	if by.IsValid() {
+		by.Set(reflect.ValueOf(m.Operator))
+	}
+	isRemoved := reflect.ValueOf(m.model).Elem().FieldByName("IsRemoved")
+	if isRemoved.IsValid() {
+		removeValue := true
+		isRemoved.Set(reflect.ValueOf(&removeValue))
+	}
+
+	// check IsLocked flag
+	record := map[string]interface{}{}
+	m.Coll.Find(m.Ctx, bson.D{bson.E{Key: "_id", Value: id}}).Select(bson.M{"IsLocked": 1}).One(&record)
+	if record != nil {
+		if v, found := record["IsLocked"]; found {
+			if v.(bool) {
+				return errors.New("Record locked for delete.")
+			}
+		}
+	}
+
+	if err := m.Coll.UpdateOne(m.Ctx, bson.M{"_id": id.Interface()}, bson.M{"$set": m.model}); err != nil {
+		return err
+	}
+
+	if !m.SaveLog {
+		return nil
+	}
+
+	if err := m.saveLog(DELETE); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteWithLog
+func (m *Do) DeleteWithLog() error {
+	if err := m.Delete(); err != nil {
+		return err
+	}
+
+	if err := m.saveLog(DELETE); err != nil {
+		return err
+	}
+	return nil
+}
+
+//Erase all is hard Delete with raw condition (no predefined skip IsRemoved:true)
+func (m *Do) EraseAll() error {
+	_, err := m.RemoveAll()
+	return err
+}
+
+// RemoveAll is hardDelete
+func (m *Do) RemoveAll() (int64, error) {
+	if m.Query == nil {
+		return 0, errors.New("Cannot remove without condition")
+	}
+
+	result, err := m.Coll.RemoveAll(m.Ctx, m.Query)
+	if err != nil {
+		return 0, err
+	}
+	return result.DeletedCount, nil
+}
+
+// Erase all with log
+func (m *Do) EraseAllWithLog() error {
+	if err := m.EraseAll(); err != nil {
+		return err
+	}
+	if err := m.saveLog(ERASE); err != nil {
+		return err
+	}
+	return nil
+}
+
+//DirectSave method, upsert record without set UpdatedBy and UpdatedAt
+func (m *Do) DirectSave() error {
+	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	// check IsLocked flag
+	record := map[string]interface{}{}
+	m.Coll.Find(m.Ctx, bson.D{bson.E{Key: "_id", Value: id}}).Select(bson.M{"IsLocked": 1}).One(&record)
+	if record != nil {
+		if v, found := record["IsLocked"]; found {
+			if v.(bool) {
+				return errors.New("Record is locked for update.")
+			}
+		}
+	}
+
+	err := m.Coll.UpdateOne(m.Ctx, bson.M{"_id": id.Interface()}, bson.M{"$set": m.model})
+	return err
+}
+
+//DirectSaveWithLog save record and inset a new changelog record
+func (m *Do) DirectSaveWithLog() error {
+	if err := m.DirectSave(); err != nil {
+		return err
+	}
+	if err := m.saveLog(UPDATE); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ---------- General revmongo fetch functions -----------
+
+//GenQuery export qmgo.QueryI for further query chain
+func (m *Do) Q() qmgo.QueryI {
+	return m.findQ()
+}
+
+//Count
+func (m *Do) Count() int64 {
+	query := m.findQ()
+	count, _ := query.Count()
+	return int64(count)
+}
+
+//---------retrieve functions
+// FindAll except removed, i is interface address
+func (m *Do) FindAll(i interface{}) error {
+	return m.findQ().All(i)
+}
+
+// FindAll except removed, i is interface address
+func (m *Do) FindAllIncludeRemoved(i interface{}) error {
+	return m.findIncludeRemovedQ().All(i)
+}
+
+//Get will retrieve by _id
+func (m *Do) Get() error {
+	return m.findByIdQ().One(m.model)
+}
+
+//GetByQ get first one based on query, model will be updated
+func (m *Do) GetByQ() error {
+	return m.findQ().One(m.model)
+}
+
+// Fetch same as Get, but bind to another struct (uses for model name diff)
+func (m *Do) Fetch(record interface{}) error {
+	err := m.findByIdQ().One(record)
+	return err
+}
+
+//QueryIncludeRemoved get first one based on query include isRemoved: true, model will be updated
+func (m *Do) QueryIncludeRemoved() error {
+	return m.findIncludeRemovedQ().One(m.model)
+}
+
+//FetchByQ match result to a structure
+func (m *Do) FetchByQ(record interface{}) error {
+	return m.findQ().One(record)
+}
+
+//Select query and select columns
+func (m *Do) FindWithSelect(i interface{}, cols []string) error {
+	sCols := bson.M{}
+	for _, v := range cols {
+		if strings.HasPrefix(v, "-") {
+			t := v[1 : len(v)-1]
+			sCols[t] = -1
+		} else {
+			sCols[v] = 1
+		}
+	}
+	return m.findQ().Select(sCols).All(i)
+}
+
+//Distinct
+func (m *Do) Distinct(key string, i interface{}) error {
+	return m.findQ().Distinct(key, i)
+}
+
+//GetWithSelect, limit cols
+func (m *Do) GetWithSelect(cols []string) error {
+	sCols := bson.M{}
+	for _, v := range cols {
+		if strings.HasPrefix(v, "-") {
+			t := v[1 : len(v)-1]
+			sCols[t] = -1
+		} else {
+			sCols[v] = 1
+		}
+	}
+	return m.findByIdQ().Select(sCols).One(m.model)
+}
+
+// FetchByQAndDelete find One record according to Query and mark as IsRemoved
+func (m *Do) FetchByQAndDelete() error {
+	colName := getModelName(m.model)
+	coll := DB.Collection(colName)
+	if m.Query == nil {
+		m.Query = bson.M{}
+	}
+
+	m.Query["IsRemoved"] = bson.M{"$ne": true}
+
+	err := coll.UpdateOne(m.Ctx, m.Query, bson.M{"$set": bson.M{"IsRemoved": true}})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// FetchByQAndUpsert find One record and update or insert
+func (m *Do) FetchByQAndUpsert(setValue interface{}) error {
+	colName := getModelName(m.model)
+	coll := DB.Collection(colName)
+	if m.Query == nil {
+		return errors.New("Query cannot be nil must be defined.")
+	}
+
+	if err := coll.UpdateOne(m.Ctx, m.Query, bson.M{"$set": setValue}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// FetchByQAndUpdate find One record and update no insert
+func (m *Do) FetchByQAndUpdate(setValue interface{}) error {
+	colName := getModelName(m.model)
+	coll := DB.Collection(colName)
+	if m.Query == nil {
+		return errors.New("Query cannot be nil must be defined.")
+	}
+
+	if err := coll.UpdateOne(m.Ctx, m.Query, bson.M{"$set": setValue}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ---------- internal functions -----------
+
+//getModelName reflect string name from model
 func getModelName(m interface{}) string {
 	var c string
 	switch m.(type) {
@@ -76,226 +548,70 @@ func getModelName(m interface{}) string {
 	return c
 }
 
-// Create, generate objectId, upsert record with CreatedAt as Now
-func (m *Do) Create() error {
-	//generate new object Id
-	newId := bson.NewObjectId()
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	id.Set(reflect.ValueOf(newId))
-	x := reflect.ValueOf(m.model).Elem().FieldByName("CreatedAt")
-	x.Set(reflect.ValueOf(time.Now()))
-	by := reflect.ValueOf(m.model).Elem().FieldByName("CreatedBy")
-	by.Set(reflect.ValueOf(m.Operator))
-	err := m.collection.Insert(m.model)
-
-	return err
-}
-
-// CreateWithLog record log for creation
-func (m *Do) CreateWithLog() error {
-	var err error
-	err = m.Create()
-	if err != nil {
-		return err
-	}
-
-	err = m.saveLog(CREATE)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// Create, generate objectId, upsert record with CreatedAt as Now
-func (m *Do) Upsert() error {
-	//generate new object Id
-	newId := bson.NewObjectId()
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	id.Set(reflect.ValueOf(newId))
-	x := reflect.ValueOf(m.model).Elem().FieldByName("CreatedAt")
-	x.Set(reflect.ValueOf(time.Now()))
-	by := reflect.ValueOf(m.model).Elem().FieldByName("CreatedBy")
-	by.Set(reflect.ValueOf(m.Operator))
-	_, err := m.collection.Upsert(bson.M{"_id": id.Interface()}, bson.M{"$set": m.model})
-
-	return err
-}
-
-// CreateWithLog record log for creation
-func (m *Do) UpsertWithLog() error {
-	var err error
-	err = m.Create()
-	if err != nil {
-		return err
-	}
-
-	err = m.saveLog(UPSERT)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// Save method, upsert record with UpdatedAt as now
-func (m *Do) Save() error {
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	x := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedAt")
-	x.Set(reflect.ValueOf(time.Now()))
-	by := reflect.ValueOf(m.model).Elem().FieldByName("UpdatedBy")
-	by.Set(reflect.ValueOf(m.Operator))
-	// check IsLocked flag
-	record := map[string]interface{}{}
-	m.collection.FindId(id.Interface()).Select(bson.M{"IsLocked": 1}).One(&record)
-	if record != nil {
-		if v, found := record["IsLocked"]; found {
-			if v.(bool) {
-				return errors.New("Record is locked for update.")
-			}
-		}
-	}
-
-	_, err := m.collection.Upsert(bson.M{"_id": id.Interface()}, bson.M{"$set": m.model})
-	return err
-}
-
-// SaveWithLog save record and inset a new changelog record
-func (m *Do) SaveWithLog() error {
-	var err error
-	err = m.Save()
-	if err != nil {
-		return err
-	}
-	err = m.saveLog(UPDATE)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-// Erase is hard delete according ID
-func (m *Do) Erase() error {
-	//hard delete record
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	err := m.collection.RemoveId(id.Interface())
-	return err
-}
-
-// EraseWithLog, hard delete record and insert a chagnelog
-func (m *Do) EraseWithLog() error {
-	// hard delete record
-	err := m.Erase()
-
-	// Save log
-	err = m.saveLog(ERASE)
-	if err != nil {
-		return err
-	}
-
-	return err
-}
-
-// Delete is softe delete
-func (m *Do) Delete() error {
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	x := reflect.ValueOf(m.model).Elem().FieldByName("RemovedAt")
-	x.Set(reflect.ValueOf(time.Now()))
-	by := reflect.ValueOf(m.model).Elem().FieldByName("RemovedBy")
-	by.Set(reflect.ValueOf(m.Operator))
-	removed := reflect.ValueOf(m.model).Elem().FieldByName("IsRemoved")
-	removed.Set(reflect.ValueOf(true))
-
-	// check IsLocked flag
-	record := map[string]interface{}{}
-	m.collection.FindId(id.Interface()).Select(bson.M{"IsLocked": 1}).One(&record)
-	if record != nil {
-		if v, found := record["IsLocked"]; found {
-			if v.(bool) {
-				return errors.New("Record locked for delete.")
-			}
-		}
-	}
-
-	_, err := m.collection.Upsert(bson.M{"_id": id.Interface()}, bson.M{"$set": m.model})
-	return err
-}
-
-// DeleteWithLog
-func (m *Do) DeleteWithLog() error {
-	err := m.saveLog(DELETE)
-	if err != nil {
-		return err
-	}
-	err = m.Delete()
-	if err != nil {
-		return err
-	}
-	return nil
-
-}
-
 // saveLog just copy a record to Changlog
 func (m *Do) saveLog(operation string) error {
+	log.Println(primitive.NewObjectID()) // fix unimported warning
 	id := reflect.ValueOf(m.model).Elem().FieldByName("Id").Interface()
 
 	cl := new(ChangeLog)
-	cl.Id = bson.NewObjectId()
-	cl.CreatedBy = m.Operator
-	cl.CreatedAt = time.Now()
 	cl.ChangeReason = m.Reason
 	cl.Operation = operation
-	cl.ModelObjId = id.(bson.ObjectId)
+	cl.ModelObjId = id.(primitive.ObjectID)
 	cl.ModelName = getModelName(m.model)
 	cl.ModelValue = m.model
-	_, err := m.logCollection.Upsert(bson.M{"_id": cl.Id}, bson.M{"$set": cl})
+	cl.Operator = m.Operator
+	cl.CreatedBy = m.Operator
+	cl.CreatedAt = time.Now()
+	do := NewWithCtx(m.Ctx, cl)
+	err := do.Create()
 	return err
 }
 
-// ---------- General mgo functions -----------
-
-// GenQuery export mgo.Query for further query chain
-func (m *Do) Q() *mgo.Query {
-	return m.findQ()
-}
-
-// get pipe prepares a pipe to aggregate
-func (m *Do) getPipe() *mgo.Pipe {
-	sort := bson.M{}
-	for _, field := range m.Sort {
-		if field[0] == '-' {
-			sort[field[1:]] = -1
-		} else {
-			sort[field] = 1
-		}
+//findQ conduct qmgo.QueryI, skip IsRemoved: true
+func (m *Do) findQ() qmgo.QueryI {
+	if m.Query == nil {
+		m.Query = bson.M{}
 	}
-	pipe := []bson.M{}
-	pipe = append(pipe, bson.M{"$match": m.Query})
-	if len(sort) > 0 {
-		pipe = append(pipe, bson.M{"$sort": sort})
+	m.Query["IsRemoved"] = bson.M{"$ne": true}
+
+	q := m.Coll.Find(m.Ctx, m.Query)
+	//sort
+	if m.Sort != nil {
+		q = q.Sort(m.Sort...)
 	}
+
+	//skip
 	if m.Skip != 0 {
-		pipe = append(pipe, bson.M{"$skip": m.Skip})
-	}
-	if m.Limit != 0 {
-		pipe = append(pipe, bson.M{"$limit": m.Limit})
-	}
-	return m.collection.Pipe(pipe)
-}
-// findQ conduct mgo.Query, skip IsRemoved: true
-func (m *Do) findQ() *mgo.Query {
-	var query *mgo.Query
-	//do not query removed value
-	rmQ := []interface{}{bson.M{"is_removed": bson.M{"$ne": true}}, bson.M{"IsRemoved": bson.M{"$ne": true}}}
-	if m.Query != nil {
-		if v, found := m.Query["$and"]; !found {
-			m.Query["$and"] = rmQ
-		} else {
-			m.Query["$and"] = append(v.([]interface{}), rmQ...)
-		}
-	} else {
-		m.Query = bson.M{"$and": rmQ}
+		q = q.Skip(m.Skip)
 	}
 
-	query = m.collection.Find(m.Query)
+	//limit
+	if m.Limit != 0 {
+		q = q.Limit(m.Limit)
+	}
+
+	//Select
+	if m.Select != nil {
+		sCols := bson.M{}
+		for _, v := range m.Select {
+			if strings.HasPrefix(v, "-") {
+				t := v[1 : len(v)-1]
+				sCols[t] = -1
+			} else {
+				sCols[v] = 1
+			}
+		}
+		q = q.Select(sCols)
+	}
+
+	return q
+}
+
+//findIncludeRemovedQ conduct qmgo.QueryI, including marked as removed: isRemoved: true
+func (m *Do) findIncludeRemovedQ() qmgo.QueryI {
+	var query qmgo.QueryI
+
+	query = m.Coll.Find(m.Ctx, m.Query)
 	//sort
 	if m.Sort != nil {
 		query = query.Sort(m.Sort...)
@@ -313,178 +629,9 @@ func (m *Do) findQ() *mgo.Query {
 	return query
 }
 
-// findIncludeRemovedQ conduct mgo.Query, including marked as removed: isRemoved: true
-func (m *Do) findIncludeRemovedQ() *mgo.Query {
-	var query *mgo.Query
-
-	query = m.collection.Find(m.Query)
-	//sort
-	if m.Sort != nil {
-		query = query.Sort(m.Sort...)
-	}
-
-	//skip
-	if m.Skip != 0 {
-		query = query.Skip(m.Skip)
-	}
-
-	//limit
-	if m.Limit != 0 {
-		query = query.Limit(m.Limit)
-	}
-	return query
-}
-
-// findByIdQ, skip IsRemoved:true
-func (m *Do) findByIdQ() *mgo.Query {
+//findByIdQ, skip IsRemoved:true
+func (m *Do) findByIdQ() qmgo.QueryI {
 	id := reflect.ValueOf(m.model).Elem().FieldByName("Id").Interface()
 	m.Query = bson.M{"_id": id}
 	return m.findQ()
-}
-
-// Count
-func (m *Do) Count() int64 {
-	query := m.findQ()
-	count, _ := query.Count()
-	return int64(count)
-}
-
-// ---------retrieve functions
-
-// FindAllAggregate use pipe to find all records
-func (m *Do) FindAllAggregate(i interface{}) error {
-	pipe := m.getPipe().AllowDiskUse() // allow disk use for large data set, avoid memory limitation(100MB)
-	err := pipe.All(i)
-	return err
-}
-
-// FindAll except removed, i is interface address
-func (m *Do) FindAll(i interface{}) error {
-	query := m.findQ()
-	err := query.All(i)
-	return err
-}
-
-// FindAll except removed, i is interface address
-func (m *Do) FindAllIncludeRemoved(i interface{}) error {
-	query := m.findIncludeRemovedQ()
-	err := query.All(i)
-	return err
-}
-
-// Get will retrieve by _id
-func (m *Do) Get() error {
-	query := m.findByIdQ()
-	err := query.One(m.model)
-	return err
-}
-
-// GetByQ get first one based on query, model will be updated
-func (m *Do) GetByQ() error {
-	query := m.findQ()
-	err := query.One(m.model)
-	return err
-}
-
-// QueryIncludeRemoved get first one based on query include isRemoved: true, model will be updated
-func (m *Do) QueryIncludeRemoved() error {
-	query := m.findIncludeRemovedQ()
-	err := query.One(m.model)
-	return err
-}
-
-// Fetch match result to a structure
-func (m *Do) FetchByQ(record interface{}) error {
-	query := m.findQ()
-	err := query.One(record)
-	return err
-}
-
-// Select query and select columns
-func (m *Do) FindWithSelect(i interface{}, cols []string) error {
-	sCols := bson.M{}
-	for _, v := range cols {
-		if strings.HasPrefix(v, "-") {
-			t := v[1 : len(v)-1]
-			sCols[t] = -1
-		} else {
-			sCols[v] = 1
-		}
-	}
-	query := m.findQ().Select(sCols)
-	err := query.All(i)
-	return err
-}
-
-// Distinct
-func (m *Do) Distinct(key string, i interface{}) error {
-	err := m.findQ().Distinct(key, i)
-	return err
-}
-
-// GetWithSelect, limit cols
-func (m *Do) GetWithSelect(cols []string) error {
-	sCols := bson.M{}
-	for _, v := range cols {
-		if strings.HasPrefix(v, "-") {
-			t := v[1 : len(v)-1]
-			sCols[t] = -1
-		} else {
-			sCols[v] = 1
-		}
-	}
-	query := m.findByIdQ().Select(sCols)
-	err := query.One(m.model)
-	return err
-}
-
-// Erase all is hard Delete with raw condition (no predefined skip IsRemoved:true)
-func (m *Do) EraseAll() error {
-	_, err := m.collection.RemoveAll(m.Query)
-	return err
-}
-
-// Erase all with log
-func (m *Do) EraseAllWithLog() error {
-	err := m.EraseAll()
-
-	// Save log
-	err = m.saveLog(ERASE)
-	if err != nil {
-		return err
-	}
-
-	return err
-}
-
-// DirectSave method, upsert record without set UpdatedBy and UpdatedAt
-func (m *Do) DirectSave() error {
-	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
-	// check IsLocked flag
-	record := map[string]interface{}{}
-	m.collection.FindId(id.Interface()).Select(bson.M{"IsLocked": 1}).One(&record)
-	if record != nil {
-		if v, found := record["IsLocked"]; found {
-			if v.(bool) {
-				return errors.New("Record is locked for update.")
-			}
-		}
-	}
-
-	_, err := m.collection.Upsert(bson.M{"_id": id.Interface()}, bson.M{"$set": m.model})
-	return err
-}
-
-// DirectSaveWithLog save record and inset a new changelog record
-func (m *Do) DirectSaveWithLog() error {
-	var err error
-	err = m.DirectSave()
-	if err != nil {
-		return err
-	}
-	err = m.saveLog(UPDATE)
-	if err != nil {
-		return err
-	}
-	return nil
 }
