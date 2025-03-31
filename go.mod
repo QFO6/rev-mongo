@@ -1,4 +1,4 @@
-module github.com/QFO6/rev-mongo
+module github.com/QFO6/rev-mongo/v2
 
 go 1.19
 
