@@ -10,13 +10,16 @@ import (
 	"github.com/qiniu/qmgo"
 	"github.com/revel/revel"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 var (
-	DBName string
-	Dial   string
-	Client *qmgo.Client
-	DB     *qmgo.Database
+	DBName         string
+	Dial           string
+	Client         *qmgo.Client
+	OfficialClient *mongo.Client
+	DB             *qmgo.Database
 )
 
 func Init() {
@@ -74,6 +77,33 @@ func Connect() {
 			}
 		}
 	}
+	if OfficialClient == nil {
+		ctx := context.Background()
+		OfficialClient, err = NewOfficialMongoClient(ctx)
+		if err != nil {
+			OfficialClient = nil
+			revel.AppLog.Errorf("Could not connect to Mongo DB (official). Error: %v", err)
+			for i := 0; i < 3; i++ {
+				revel.AppLog.Info("Retrying connection to Mongo DB (official) ...")
+				time.Sleep(3 * time.Second)
+				OfficialClient, err = NewOfficialMongoClient(ctx)
+				if err == nil {
+					break
+				} else {
+					revel.AppLog.Errorf("Retry %v failed to connect to Mongo DB (official). Error: %v", i+1, err)
+				}
+			}
+		}
+	}
+}
+
+func NewOfficialMongoClient(ctx context.Context) (*mongo.Client, error) {
+	if Dial == "" {
+		return nil, fmt.Errorf("Mongodb connection not defined")
+	}
+	clientOptions := options.Client().ApplyURI(Dial)
+	client, err := mongo.Connect(ctx, clientOptions)
+	return client, err
 }
 
 // ObjectIDBinder do binding
