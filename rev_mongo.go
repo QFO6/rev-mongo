@@ -9,11 +9,13 @@ import (
 	"time"
 
 	"github.com/qiniu/qmgo"
+	qopts "github.com/qiniu/qmgo/options"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-//Do wrap all common functions
+// Do wrap all common functions
 type Do struct {
 	model    interface{}
 	Ctx      context.Context
@@ -36,14 +38,14 @@ func New(model interface{}) *Do {
 	return &Do{model: model, Coll: coll, Ctx: context.Background()}
 }
 
-//NewDo initiate with input model and db name, backfoward compatible
+// NewDo initiate with input model and db name, backfoward compatible
 func NewDo(dbName string, model interface{}) *Do {
 	colName := getModelName(model)
 	coll := Client.Database(dbName).Collection(colName)
 	return &Do{model: model, Coll: coll, Ctx: context.Background()}
 }
 
-//NewWithDB initiate with input model and db name
+// NewWithDB initiate with input model and db name
 func NewWithDBName(dbName string, model interface{}) *Do {
 	colName := getModelName(model)
 	coll := Client.Database(dbName).Collection(colName)
@@ -143,7 +145,9 @@ func (m *Do) Save() error {
 		l.Set(reflect.ValueOf(timeNow))
 	}
 
-	if err := m.Coll.UpdateOne(m.Ctx, bson.M{"_id": id.Interface()}, bson.M{"$set": m.model}); err != nil {
+	if err := m.Coll.UpdateOne(m.Ctx, bson.M{"_id": id.Interface()}, bson.M{"$set": m.model}, qopts.UpdateOptions{
+		UpdateOptions: options.Update().SetUpsert(true),
+	}); err != nil {
 		return err
 	}
 
@@ -182,7 +186,9 @@ func (m *Do) SaveIf() error {
 	query := m.Query
 	query["_id"] = id.Interface()
 
-	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}); err != nil {
+	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}, qopts.UpdateOptions{
+		UpdateOptions: options.Update().SetUpsert(true),
+	}); err != nil {
 		return err
 	}
 
@@ -220,7 +226,9 @@ func (m *Do) SaveIfWithLog() error {
 	query := m.Query
 	query["_id"] = id.Interface()
 
-	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}); err != nil {
+	if err := m.Coll.UpdateOne(m.Ctx, query, bson.M{"$set": m.model}, qopts.UpdateOptions{
+		UpdateOptions: options.Update().SetUpsert(true),
+	}); err != nil {
 		return err
 	}
 
@@ -342,7 +350,7 @@ func (m *Do) DeleteWithLog() error {
 	return nil
 }
 
-//Erase all is hard Delete with raw condition (no predefined skip IsRemoved:true)
+// Erase all is hard Delete with raw condition (no predefined skip IsRemoved:true)
 func (m *Do) EraseAll() error {
 	_, err := m.RemoveAll()
 	return err
@@ -372,7 +380,7 @@ func (m *Do) EraseAllWithLog() error {
 	return nil
 }
 
-//DirectSave method, upsert record without set UpdatedBy and UpdatedAt
+// DirectSave method, upsert record without set UpdatedBy and UpdatedAt
 func (m *Do) DirectSave() error {
 	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
 	// check IsLocked flag
@@ -390,7 +398,7 @@ func (m *Do) DirectSave() error {
 	return err
 }
 
-//DirectSaveWithLog save record and inset a new changelog record
+// DirectSaveWithLog save record and inset a new changelog record
 func (m *Do) DirectSaveWithLog() error {
 	if err := m.DirectSave(); err != nil {
 		return err
@@ -403,19 +411,19 @@ func (m *Do) DirectSaveWithLog() error {
 
 // ---------- General revmongo fetch functions -----------
 
-//GenQuery export qmgo.QueryI for further query chain
+// GenQuery export qmgo.QueryI for further query chain
 func (m *Do) Q() qmgo.QueryI {
 	return m.findQ()
 }
 
-//Count
+// Count
 func (m *Do) Count() int64 {
 	query := m.findQ()
 	count, _ := query.Count()
 	return int64(count)
 }
 
-//---------retrieve functions
+// ---------retrieve functions
 // FindAll except removed, i is interface address
 func (m *Do) FindAll(i interface{}) error {
 	return m.findQ().All(i)
@@ -426,12 +434,12 @@ func (m *Do) FindAllIncludeRemoved(i interface{}) error {
 	return m.findIncludeRemovedQ().All(i)
 }
 
-//Get will retrieve by _id
+// Get will retrieve by _id
 func (m *Do) Get() error {
 	return m.findByIdQ().One(m.model)
 }
 
-//GetByQ get first one based on query, model will be updated
+// GetByQ get first one based on query, model will be updated
 func (m *Do) GetByQ() error {
 	return m.findQ().One(m.model)
 }
@@ -442,17 +450,17 @@ func (m *Do) Fetch(record interface{}) error {
 	return err
 }
 
-//QueryIncludeRemoved get first one based on query include isRemoved: true, model will be updated
+// QueryIncludeRemoved get first one based on query include isRemoved: true, model will be updated
 func (m *Do) QueryIncludeRemoved() error {
 	return m.findIncludeRemovedQ().One(m.model)
 }
 
-//FetchByQ match result to a structure
+// FetchByQ match result to a structure
 func (m *Do) FetchByQ(record interface{}) error {
 	return m.findQ().One(record)
 }
 
-//Select query and select columns
+// Select query and select columns
 func (m *Do) FindWithSelect(i interface{}, cols []string) error {
 	sCols := bson.M{}
 	for _, v := range cols {
@@ -466,12 +474,12 @@ func (m *Do) FindWithSelect(i interface{}, cols []string) error {
 	return m.findQ().Select(sCols).All(i)
 }
 
-//Distinct
+// Distinct
 func (m *Do) Distinct(key string, i interface{}) error {
 	return m.findQ().Distinct(key, i)
 }
 
-//GetWithSelect, limit cols
+// GetWithSelect, limit cols
 func (m *Do) GetWithSelect(cols []string) error {
 	sCols := bson.M{}
 	for _, v := range cols {
@@ -532,7 +540,7 @@ func (m *Do) FetchByQAndUpdate(setValue interface{}) error {
 
 // ---------- internal functions -----------
 
-//getModelName reflect string name from model
+// getModelName reflect string name from model
 func getModelName(m interface{}) string {
 	var c string
 	switch m.(type) {
@@ -567,7 +575,7 @@ func (m *Do) saveLog(operation string) error {
 	return err
 }
 
-//findQ conduct qmgo.QueryI, skip IsRemoved: true
+// findQ conduct qmgo.QueryI, skip IsRemoved: true
 func (m *Do) findQ() qmgo.QueryI {
 	if m.Query == nil {
 		m.Query = bson.M{}
@@ -607,7 +615,7 @@ func (m *Do) findQ() qmgo.QueryI {
 	return q
 }
 
-//findIncludeRemovedQ conduct qmgo.QueryI, including marked as removed: isRemoved: true
+// findIncludeRemovedQ conduct qmgo.QueryI, including marked as removed: isRemoved: true
 func (m *Do) findIncludeRemovedQ() qmgo.QueryI {
 	var query qmgo.QueryI
 
@@ -629,7 +637,7 @@ func (m *Do) findIncludeRemovedQ() qmgo.QueryI {
 	return query
 }
 
-//findByIdQ, skip IsRemoved:true
+// findByIdQ, skip IsRemoved:true
 func (m *Do) findByIdQ() qmgo.QueryI {
 	id := reflect.ValueOf(m.model).Elem().FieldByName("Id").Interface()
 	m.Query = bson.M{"_id": id}
