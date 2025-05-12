@@ -74,6 +74,9 @@ func Collection(dbName string, m interface{}) *qmgo.Collection {
 func (m *Do) Create() error {
 	timeNow := time.Now()
 	id := reflect.ValueOf(m.model).Elem().FieldByName("Id")
+	if id.IsValid() && !id.IsZero() {
+		id.Set(reflect.ValueOf(primitive.NilObjectID))
+	}
 	x := reflect.ValueOf(m.model).Elem().FieldByName("CreatedAt")
 	if x.IsValid() {
 		x.Set(reflect.ValueOf(timeNow))
